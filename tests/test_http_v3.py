@@ -180,3 +180,41 @@ class TestDNSResolutionRetry(unittest.TestCase):
 
         # Caller passed retries=2, and non-DNS URLError doesn't expand it.
         self.assertEqual(mock_urlopen.call_count, 2)
+
+    @patch("lib.http.urllib.request.urlopen")
+    @patch("lib.http.time.sleep")
+    def test_dns_widening_does_not_leak_into_subsequent_non_dns_urlerror(
+        self, mock_sleep, mock_urlopen
+    ):
+        """Mixed sequence: DNS-then-non-DNS must respect caller's original retries.
+
+        Without the fix, the first gaierror widens effective_retries from 2 to
+        MIN_DNS_RETRIES=3, and a subsequent ConnectionRefused on attempt 1
+        slips into a third overall attempt — exceeding what the caller asked
+        for. Each non-DNS error path must gate on the original `retries`.
+        """
+        import socket
+        dns_err = urllib.error.URLError(socket.gaierror(-2, "Name or service not known"))
+        conn_err = urllib.error.URLError(ConnectionRefusedError(111, "Connection refused"))
+        mock_urlopen.side_effect = [dns_err, conn_err, conn_err]  # 3rd would only fire if budget leaked
+
+        with self.assertRaises(http.HTTPError):
+            http.request("GET", "http://flaky.example", retries=2)
+
+        # Caller asked for at most 2 attempts. DNS widening must not give us a 3rd.
+        self.assertEqual(mock_urlopen.call_count, 2)
+
+    @patch("lib.http.urllib.request.urlopen")
+    @patch("lib.http.time.sleep")
+    def test_dns_widening_does_not_leak_into_subsequent_oserror(
+        self, mock_sleep, mock_urlopen
+    ):
+        """Mixed sequence: DNS-then-OSError must respect caller's original retries."""
+        import socket
+        dns_err = urllib.error.URLError(socket.gaierror(-2, "Name or service not known"))
+        mock_urlopen.side_effect = [dns_err, TimeoutError("timed out"), TimeoutError("timed out")]
+
+        with self.assertRaises(http.HTTPError):
+            http.request("GET", "http://flaky.example", retries=2)
+
+        self.assertEqual(mock_urlopen.call_count, 2)

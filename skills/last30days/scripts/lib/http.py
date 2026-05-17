@@ -132,7 +132,9 @@ def request(
                 if rate_limit_count >= max_429_retries:
                     raise last_error
 
-            if attempt < effective_retries - 1:
+            # HTTP errors respect the caller's original `retries`; only DNS
+            # failures get the widened `effective_retries` budget.
+            if attempt < retries - 1:
                 if e.code == 429:
                     # Respect Retry-After header, fall back to exponential backoff
                     retry_after = e.headers.get("Retry-After") if hasattr(e, 'headers') else None
@@ -143,10 +145,15 @@ def request(
                             delay = RETRY_DELAY * (2 ** attempt) + 1
                     else:
                         delay = RETRY_DELAY * (2 ** attempt) + 1  # 3s, 5s, 9s...
-                    log(f"Rate limited (429). Waiting {delay:.1f}s before retry {attempt + 2}/{effective_retries}")
+                    log(f"Rate limited (429). Waiting {delay:.1f}s before retry {attempt + 2}/{retries}")
                 else:
                     delay = RETRY_DELAY * (2 ** attempt)
                 time.sleep(delay)
+            else:
+                # Caller's original retry budget exhausted; an earlier DNS
+                # failure may have widened `effective_retries`, but that
+                # widening is DNS-only — don't grant extra HTTP attempts.
+                break
         except urllib.error.URLError as e:
             log(f"URL Error: {e.reason}")
             last_error = HTTPError(f"URL Error: {e.reason}")
@@ -170,8 +177,15 @@ def request(
                         f"retrying in {delay:.1f}s"
                     )
                     time.sleep(delay)
-            elif attempt < effective_retries - 1:
+            elif attempt < retries - 1:
+                # Non-DNS URLError (e.g. ConnectionRefused) respects the
+                # caller's original retry budget, not the DNS-widened bound.
                 time.sleep(RETRY_DELAY * (attempt + 1))
+            else:
+                # Caller's original retry budget exhausted; an earlier DNS
+                # failure widening `effective_retries` does not carry over
+                # to non-DNS error paths.
+                break
         except json.JSONDecodeError as e:
             log(f"JSON decode error: {e}")
             last_error = HTTPError(f"Invalid JSON response: {e}")
@@ -180,8 +194,12 @@ def request(
             # Handle socket-level errors (connection reset, timeout, etc.)
             log(f"Connection error: {type(e).__name__}: {e}")
             last_error = HTTPError(f"Connection error: {type(e).__name__}: {e}")
-            if attempt < effective_retries - 1:
+            if attempt < retries - 1:
+                # Socket errors respect the caller's original retry budget.
                 time.sleep(RETRY_DELAY * (attempt + 1))
+            else:
+                # Original budget exhausted; DNS widening doesn't apply here.
+                break
 
         attempt += 1
 
