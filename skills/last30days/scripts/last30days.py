@@ -379,7 +379,7 @@ def subrun_kwargs_for(
 
     subreddits = _choose("subreddits", "subreddits")
     if isinstance(subreddits, list):
-        subreddits = [s.strip().lstrip("r/") for s in subreddits if s.strip()] or None
+        subreddits = [s.strip().removeprefix("r/") for s in subreddits if s.strip()] or None
 
     x_related = plan_entry.get("x_related")
     if isinstance(x_related, list):
@@ -591,7 +591,7 @@ def main() -> int:
     depth = "deep" if args.deep else "quick" if args.quick else "default"
     try:
         x_related = [h.strip() for h in args.x_related.split(",") if h.strip()] if args.x_related else None
-        subreddits = [s.strip().lstrip("r/") for s in args.subreddits.split(",") if s.strip()] if args.subreddits else None
+        subreddits = [s.strip().removeprefix("r/") for s in args.subreddits.split(",") if s.strip()] if args.subreddits else None
         tiktok_hashtags = [h.strip().lstrip("#") for h in args.tiktok_hashtags.split(",") if h.strip()] if args.tiktok_hashtags else None
         tiktok_creators = [c.strip().lstrip("@") for c in args.tiktok_creators.split(",") if c.strip()] if args.tiktok_creators else None
         ig_creators = [c.strip().lstrip("@") for c in args.ig_creators.split(",") if c.strip()] if args.ig_creators else None
