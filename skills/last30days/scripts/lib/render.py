@@ -1054,12 +1054,6 @@ def render_brief(report: schema.Report, cluster_limit: int = 8) -> str:
     return "\n".join(lines).strip() + "\n"
 
 
-_QUESTION_WORDS: frozenset[str] = frozenset({
-    "what", "why", "how", "when", "where", "who", "which",
-    "is", "are", "can", "does", "will", "should", "would", "could",
-})
-
-
 def _extract_audience_questions(candidates: list[schema.Candidate]) -> list[str]:
     """Return titles that read as audience questions, deduped and in ranked order."""
     questions: list[str] = []
@@ -1068,7 +1062,6 @@ def _extract_audience_questions(candidates: list[schema.Candidate]) -> list[str]
         title = candidate.title.strip()
         if not title:
             continue
-        first_word = title.split()[0].lower().rstrip("?")
         if title.endswith("?"):
             norm = title.lower()
             if norm not in seen:
