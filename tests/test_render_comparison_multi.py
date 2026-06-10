@@ -101,11 +101,11 @@ class RenderComparisonMultiTests(unittest.TestCase):
         self.assertIn("## xAI", rendered)
         # Scaffold table header has a column per entity
         self.assertIn("| Dimension | OpenAI | Anthropic | xAI |", rendered)
-        # The narrative-lens axis is emitted as a scaffold row
-        self.assertIn("| Setting the narrative? |", rendered)
-        # Fill instructions carry the scope + artifact gate (no verdicts for
-        # people/ownerless topics, no pitch from memory)
-        self.assertIn("never supply the pitch from memory", rendered)
+        # No verdict row: the pitch-vs-pulse signal ships as synthesis prose,
+        # not a table axis (early drafts emitted a "Setting the narrative?" row)
+        self.assertNotIn("Setting the narrative?", rendered)
+        # "What it is" grounds in positioning fetched this run, never memory
+        self.assertIn("never from memory", rendered)
         # Envelope scaffolding present
         self.assertIn("EVIDENCE FOR SYNTHESIS", rendered)
         self.assertIn("END OF last30days CANONICAL OUTPUT", rendered)

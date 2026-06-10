@@ -531,12 +531,10 @@ def _render_comparison_scaffold(topic: str) -> list[str]:
     Returns empty list if topic is not a comparison query. When present,
     the block is bracketed so the synthesizer can detect it and pass through.
 
-    Axes are the 9 from the April 9 launch-video exemplar (suited to AI-tool
-    comparisons) plus "Setting the narrative?", which asks whether each entity's
-    community conversation is about what the entity itself pitches, or about
-    something else (pricing, rivals, incidents). For comparisons where an axis
-    does not apply, the synthesizer writes N/A or a topic-appropriate substitute
-    in that row.
+    Axes match the April 9 launch-video exemplar (9 axes suited to AI-tool
+    comparisons). For non-AI-tool comparisons, the synthesizer writes N/A
+    or topic-appropriate substitutes in irrelevant rows. The "What it is" row
+    grounds in first-party positioning fetched during the run when available.
     """
     entities = _parse_comparison_entities(topic)
     if not entities:
@@ -546,11 +544,10 @@ def _render_comparison_scaffold(topic: str) -> list[str]:
     header = "| Dimension | " + " | ".join(entities) + " |"
     # Separator row matching column count
     separator = "|" + "|".join(["---"] * (len(entities) + 1)) + "|"
-    # 9 axes from the April 9 exemplar plus "Setting the narrative?" (pitch vs.
-    # what the community actually talks about). See the function docstring.
+    # 9 axes from the April 9 exemplar. Model fills with topic-appropriate
+    # content; irrelevant axes get "N/A" rather than invented data.
     axes = [
         "What it is",
-        "Setting the narrative?",
         "GitHub stars",
         "Philosophy",
         "Skills",
@@ -562,20 +559,11 @@ def _render_comparison_scaffold(topic: str) -> list[str]:
     ]
     body = [f"| {axis} | " + " | ".join([" "] * len(entities)) + " |" for axis in axes]
 
-    # Generic fill rules plus guidance for "Setting the narrative?" - the one
-    # axis that needs a judgement, not a lookup.
     fill_instructions = (
         "Fill each cell based on the research above. Keep cells short (5-15 words). "
         "Use ' - ' (hyphen with spaces) not em-dashes. Write N/A for axes that do not apply to this topic class. "
-        "For the \"Setting the narrative?\" row, judge whether each entity's community conversation is about "
-        "what the entity itself pitches: start the cell with Yes / Partly / No / Unclear, then name the topic "
-        "the community is ACTUALLY on, anchored to a real item (e.g. \"No - pitches uptime, but the top thread "
-        "is friendly-fraud (323pt HN)\"). Use Unclear when evidence is thin or polluted with unrelated "
-        "brand-name matches; do NOT infer a verdict from vibes. Write N/A for entities with no public pitch: "
-        "people (always, even famous founders - the lens applies to companies and products, never persons), "
-        "events, abstract concepts, and ownerless topics with no authoritative first party (e.g. Bitcoin). "
-        "Only fill a verdict when the entity's first-party positioning was actually fetched during this "
-        "run's research; if it was not, write Unclear - never supply the pitch from memory. "
+        "Ground the \"What it is\" row in first-party positioning fetched during this run's research when "
+        "available - describe each entity as it pitches itself today, never from memory. "
         "This scaffold matches the April 9 launch-video exemplar shape."
     )
 
