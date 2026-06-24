@@ -75,7 +75,7 @@ def _get_firefox_profiles_dir() -> Optional[Path]:
             return path
         # Some distros (e.g. Fedora) honour $XDG_CONFIG_HOME
         xdg_config = os.environ.get("XDG_CONFIG_HOME")
-        if xdg_config:
+        if xdg_config and os.path.isabs(xdg_config):
             path = Path(xdg_config) / "mozilla" / "firefox"
         else:
             path = Path.home() / ".config" / "mozilla" / "firefox"
