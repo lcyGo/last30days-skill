@@ -6,6 +6,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 CONFIGURATION = ROOT / "CONFIGURATION.md"
+README = ROOT / "README.md"
 SKILL_MD = ROOT / "skills" / "last30days" / "SKILL.md"
 UI_PY = ROOT / "skills" / "last30days" / "scripts" / "lib" / "ui.py"
 
@@ -37,6 +38,7 @@ def test_scrapecreators_copy_uses_canonical_free_call_count():
     text = "\n".join(
         [
             CONFIGURATION.read_text(encoding="utf-8"),
+            README.read_text(encoding="utf-8"),
             SKILL_MD.read_text(encoding="utf-8"),
             UI_PY.read_text(encoding="utf-8"),
         ]

@@ -10,8 +10,12 @@ SKILL_MD = ROOT / "skills" / "last30days" / "SKILL.md"
 
 def _prose_flow() -> str:
     text = SKILL_MD.read_text(encoding="utf-8")
-    start = text.index("### Non-Modal Prose Flow")
-    end = text.index("### Manual Setup Guide", start)
+    start_marker = "### Non-Modal Prose Flow"
+    end_marker = "### Manual Setup Guide"
+    start = text.find(start_marker)
+    assert start != -1, f"missing section marker: {start_marker}"
+    end = text.find(end_marker, start)
+    assert end != -1, f"missing section marker: {end_marker}"
     return text[start:end]
 
 
