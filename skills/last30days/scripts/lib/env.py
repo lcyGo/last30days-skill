@@ -84,11 +84,29 @@ BrowserCookieMode = Literal["off", "read", "plan_only"]
 class ConfigLoadPolicy:
     """Local-read gates for configuration loading.
 
-    Bare library calls use the safe default: no browser-cookie extraction. CLI
-    entry points can opt into narrower behavior after parsing command intent.
+    Bare library calls use the safe default: no browser-cookie extraction and no
+    project-scoped config. CLI entry points can opt into narrower behavior after
+    parsing command intent.
     """
 
     browser_cookies: BrowserCookieMode = "off"
+    allow_project_config: bool = False
+    inspect_ignored_project_config: bool = False
+
+
+def _truthy(value: Any) -> bool:
+    if value is None:
+        return False
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _project_config_trusted(policy: ConfigLoadPolicy, file_env: dict[str, Any]) -> bool:
+    if policy.allow_project_config:
+        return True
+    process_value = os.environ.get("LAST30DAYS_TRUST_PROJECT_CONFIG")
+    if process_value is not None:
+        return _truthy(process_value)
+    return _truthy(file_env.get("LAST30DAYS_TRUST_PROJECT_CONFIG"))
 
 
 def _check_file_permissions(path: Path) -> None:
@@ -329,13 +347,15 @@ def _find_project_env() -> Path | None:
     """Find per-project .env by walking up from cwd.
 
     Searches for .claude/last30days.env in each parent directory,
-    stopping at the user's home directory or filesystem root.
+    stopping at the git root, user's home directory, or filesystem root.
     """
     cwd = Path.cwd()
     for parent in [cwd, *cwd.parents]:
         candidate = parent / '.claude' / 'last30days.env'
         if candidate.exists():
             return candidate
+        if (parent / ".git").exists():
+            break
         # Stop at filesystem root or home
         if parent == Path.home() or parent == parent.parent:
             break
@@ -347,7 +367,7 @@ def get_config(policy: ConfigLoadPolicy | None = None) -> dict[str, Any]:
 
     Priority (highest wins):
       1. Environment variables (os.environ)
-      2. .claude/last30days.env (per-project config)
+      2. Trusted .claude/last30days.env (per-project config)
       3. ~/.config/last30days/.env (global config)
       4. macOS Keychain items prefixed ``last30days-`` (Darwin only)
     """
@@ -355,9 +375,18 @@ def get_config(policy: ConfigLoadPolicy | None = None) -> dict[str, Any]:
     # Load from global config file
     file_env = load_env_file(CONFIG_FILE) if CONFIG_FILE else {}
 
-    # Load from per-project config (overrides global)
-    project_env_path = _find_project_env()
+    # Load per-project config only when trust comes from process env, global
+    # user config, or an explicit policy. A project file cannot grant trust to
+    # itself because it is not parsed until after this decision.
+    project_config_trusted = _project_config_trusted(policy, file_env)
+    project_env_path = _find_project_env() if project_config_trusted else None
     project_env = load_env_file(project_env_path) if project_env_path else {}
+    ignored_project_env_path = None
+    ignored_project_keys: list[str] = []
+    if not project_config_trusted and policy.inspect_ignored_project_config:
+        ignored_project_env_path = _find_project_env()
+        if ignored_project_env_path:
+            ignored_project_keys = sorted(load_env_file(ignored_project_env_path).keys())
 
     # Merge file sources: project > global
     merged_env = {**file_env, **project_env}
@@ -444,6 +473,7 @@ def get_config(policy: ConfigLoadPolicy | None = None) -> dict[str, Any]:
         # Optional SearXNG instance for the keyless-search fallback rung.
         ('LAST30DAYS_SEARXNG_URL', None),
         ('FROM_BROWSER', None),
+        ('LAST30DAYS_TRUST_PROJECT_CONFIG', None),
         ('SETUP_COMPLETE', None),
         ('INCLUDE_SOURCES', ''),
         ('EXCLUDE_SOURCES', ''),
@@ -491,7 +521,9 @@ def get_config(policy: ConfigLoadPolicy | None = None) -> dict[str, Any]:
         config['_CONFIG_SOURCE'] = 'pass'
     else:
         config['_CONFIG_SOURCE'] = 'env_only'
-
+    if ignored_project_env_path:
+        config['_IGNORED_PROJECT_CONFIG'] = str(ignored_project_env_path)
+        config['_IGNORED_PROJECT_CONFIG_KEYS'] = ignored_project_keys
     config['_BROWSER_COOKIE_MODE'] = policy.browser_cookies
     config['_BROWSER_COOKIE_BROWSERS'] = cookie_extraction_browsers(config)
 
@@ -553,13 +585,30 @@ def cookie_extraction_browsers(config: dict[str, Any]) -> list[str]:
         return []
     if from_browser == "off":
         return []
-    if "," in from_browser:
-        browsers = [b.strip() for b in from_browser.split(",") if b.strip()]
-        return [b for b in browsers if b in known_browsers]
-    if from_browser in known_browsers:
-        return [from_browser]
     if from_browser == "auto":
         return silent_browsers + chromium_browsers
+    if "," in from_browser:
+        requested = [b.strip() for b in from_browser.split(",") if b.strip()]
+        resolved = [b for b in requested if b in known_browsers]
+        unknown = [b for b in requested if b not in known_browsers]
+        if unknown:
+            sys.stderr.write(
+                "[last30days] WARNING: FROM_BROWSER ignored unrecognized browser(s): "
+                f"{', '.join(unknown)} (known: {', '.join(known_browsers)})\n"
+            )
+            sys.stderr.flush()
+        return resolved
+    if from_browser in known_browsers:
+        return [from_browser]
+    # Non-empty, not off/auto, not a known browser, not a list: unrecognized.
+    # Warn rather than fail silently so a typo (FROM_BROWSER=chrme) is visible
+    # instead of looking like "no cookies found".
+    sys.stderr.write(
+        f"[last30days] WARNING: FROM_BROWSER='{from_browser}' is not a recognized "
+        f"browser; no cookies will be read (known: {', '.join(known_browsers)}, "
+        "or 'auto'/'off')\n"
+    )
+    sys.stderr.flush()
     return []
 
 
@@ -609,9 +658,11 @@ def get_x_source_with_method(config: dict[str, Any]) -> tuple[str | None, str]:
     return None, "none"
 
 
-def config_exists() -> bool:
+def config_exists(policy: ConfigLoadPolicy | None = None) -> bool:
     """Check if any configuration source exists."""
-    if _find_project_env():
+    policy = policy or ConfigLoadPolicy()
+    file_env = load_env_file(CONFIG_FILE) if CONFIG_FILE and CONFIG_FILE.exists() else {}
+    if _project_config_trusted(policy, file_env) and _find_project_env():
         return True
     if CONFIG_FILE:
         return CONFIG_FILE.exists()
