@@ -114,6 +114,21 @@ def _int_field(post: dict[str, Any], *keys: str) -> int:
     return 0
 
 
+def _is_article(url: str) -> bool:
+    """A LinkedIn long-form article (Pulse) lives under a /pulse/ URL.
+
+    Articles are higher-signal than ordinary posts — someone who wrote a
+    full article on a topic is a stronger source than someone who dashed off
+    a status update.
+    """
+    return "/pulse/" in (url or "").lower()
+
+
+# Relevance hints: articles outrank ordinary posts at rerank time.
+_ARTICLE_RELEVANCE = 0.9
+_POST_RELEVANCE = 0.5
+
+
 def parse_linkedin_response(
     result: Dict[str, Any],
     from_date: str | None = None,
@@ -135,8 +150,15 @@ def parse_linkedin_response(
         if not isinstance(post, dict):
             continue
 
+        # The live ScrapeCreators post object carries the body in `description`
+        # and the timestamp in `datePublished`. The other keys are tolerated
+        # fallbacks for shape drift / alternate endpoints.
         text = str(
-            post.get("text") or post.get("content") or post.get("body") or ""
+            post.get("description")
+            or post.get("text")
+            or post.get("content")
+            or post.get("body")
+            or ""
         ).strip()
         if not text:
             continue
@@ -147,10 +169,12 @@ def parse_linkedin_response(
             or post.get("author_name")
             or ""
         )
+        author_url = ""
         if isinstance(author_raw, dict):
             author = str(
                 author_raw.get("name") or author_raw.get("full_name") or ""
             ).strip()
+            author_url = str(author_raw.get("url") or author_raw.get("link") or "").strip()
         else:
             author = str(author_raw).strip()
 
@@ -163,7 +187,8 @@ def parse_linkedin_response(
         )
 
         date_raw = (
-            post.get("date")
+            post.get("datePublished")
+            or post.get("date")
             or post.get("postedAt")
             or post.get("posted_at")
             or post.get("createdAt")
@@ -175,18 +200,21 @@ def parse_linkedin_response(
         comments = _int_field(post, "comments", "commentsCount", "comments_count", "numComments", "commentCount")
         reposts = _int_field(post, "reposts", "repostsCount", "shares", "shareCount", "reshares")
 
+        is_article = _is_article(url)
         items.append({
             "id": post_id,
             "text": text,
             "url": url,
             "author": author,
+            "author_url": author_url,
             "date": date,
             "engagement": {
                 "likes": likes,
                 "comments": comments,
                 "reposts": reposts,
             },
-            "relevance": 0.5,
+            "relevance": _ARTICLE_RELEVANCE if is_article else _POST_RELEVANCE,
+            "is_article": is_article,
         })
 
     if from_date and to_date:
@@ -200,3 +228,122 @@ def parse_linkedin_response(
             _log(f"No posts within date range, keeping all {len(items)}")
 
     return items
+
+
+# --- Article enrichment ---------------------------------------------------
+#
+# LinkedIn articles (Pulse long-form) never appear in /search/posts results —
+# every search hit is a /posts/ status update. Articles live only on the
+# author's profile, under `articles[]`. To honor "an article is high signal"
+# we run a bounded enrichment lane: when a returned post's author name matches
+# the topic (i.e. this is a person topic and we already hold their profile
+# URL), make ONE profile call and surface their articles as high-signal items.
+
+
+def _normalize_name(s: str) -> str:
+    """Lowercase, strip punctuation, collapse whitespace — for name matching."""
+    return re.sub(r"[^a-z0-9]+", " ", (s or "").lower()).strip()
+
+
+def _best_author_match(items: List[Dict[str, Any]], topic: str) -> str:
+    """Return the profile URL of the post author whose name matches the topic.
+
+    Person-topic detection without a global predicate: if one of the returned
+    posts is authored by someone whose (multi-word) name equals or is contained
+    in the topic, treat the topic as being about that person and return their
+    profile URL. Empty string when no confident match — which keeps enrichment
+    off for keyword topics like "AI agents".
+    """
+    topic_norm = _normalize_name(topic)
+    if not topic_norm:
+        return ""
+    for item in items:
+        name = _normalize_name(item.get("author", ""))
+        url = (item.get("author_url") or "").strip()
+        if not url or len(name.split()) < 2:
+            continue
+        if name == topic_norm or name in topic_norm or topic_norm in name:
+            return url
+    return ""
+
+
+def search_profile(profile_url: str, token: str) -> Dict[str, Any]:
+    """Fetch a LinkedIn profile (incl. `articles[]`) via ScrapeCreators."""
+    if not token or not profile_url:
+        return {}
+    url = f"{SC_BASE}/profile?{urlencode({'url': profile_url})}"
+    try:
+        response = http.request(
+            "GET", url, headers={"x-api-key": token}, timeout=30
+        )
+    except http.HTTPError as exc:
+        _log(f"Profile fetch failed (HTTP {exc.status_code}): {exc}")
+        return {}
+    except Exception as exc:
+        _log(f"Profile fetch failed: {type(exc).__name__}: {exc}")
+        return {}
+    return response if isinstance(response, dict) else {}
+
+
+def parse_profile_articles(
+    profile: Dict[str, Any],
+    from_date: str | None = None,
+    to_date: str | None = None,
+) -> List[Dict[str, Any]]:
+    """Map a profile's `articles[]` into high-signal engine item dicts."""
+    articles = profile.get("articles") or []
+    author = str(profile.get("name") or "").strip()
+    items: List[Dict[str, Any]] = []
+
+    for i, art in enumerate(articles):
+        if not isinstance(art, dict):
+            continue
+        headline = str(art.get("headline") or art.get("title") or "").strip()
+        if not headline:
+            continue
+        url = str(art.get("url") or art.get("link") or "").strip()
+        date = _parse_date(art.get("datePublished") or art.get("date"))
+        items.append({
+            "id": str(art.get("id") or f"LIA{i + 1}"),
+            "text": headline,
+            "url": url,
+            "author": author,
+            "date": date,
+            "engagement": {},
+            "relevance": _ARTICLE_RELEVANCE,
+            "is_article": True,
+        })
+
+    if from_date and to_date:
+        in_range = [i for i in items if i["date"] and from_date <= i["date"] <= to_date]
+        if in_range:
+            items = in_range
+    return items
+
+
+def enrich_articles(
+    items: List[Dict[str, Any]],
+    topic: str,
+    token: str,
+    from_date: str | None = None,
+    to_date: str | None = None,
+) -> List[Dict[str, Any]]:
+    """Surface a person's LinkedIn articles as high-signal items.
+
+    Bounded: fires only on person topics (a returned post author matches the
+    topic) and makes at most ONE profile API call. No-ops gracefully when
+    there's no match, no token, no profile, or no articles.
+    """
+    if not token:
+        return []
+    profile_url = _best_author_match(items, topic)
+    if not profile_url:
+        return []
+    _log(f"Person topic — enriching articles from {profile_url}")
+    profile = search_profile(profile_url, token)
+    if not profile:
+        return []
+    articles = parse_profile_articles(profile, from_date=from_date, to_date=to_date)
+    if articles:
+        _log(f"Found {len(articles)} article(s)")
+    return articles

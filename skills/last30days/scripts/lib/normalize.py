@@ -610,23 +610,32 @@ def _normalize_linkedin(
     from_date: str,
     to_date: str,
 ) -> schema.SourceItem:
-    """Normalizer for LinkedIn posts via ScrapeCreators."""
+    """Normalizer for LinkedIn posts and articles via ScrapeCreators.
+
+    A LinkedIn article (Pulse long-form, under a /pulse/ URL) is treated as
+    high signal: it ranks above ordinary posts. Detection is belt-and-suspenders
+    — honor the parser's `is_article` flag, and re-derive from the URL so an
+    article still ranks high even if the flag wasn't set upstream.
+    """
     text = str(item.get("text") or "").strip()
     author = str(item.get("author") or "").strip()
     url = str(item.get("url") or "").strip()
+    is_article = bool(item.get("is_article")) or "/pulse/" in url.lower()
+    kind = "article" if is_article else "post"
+    default_relevance = 0.9 if is_article else 0.5
     return _source_item(
         item_id=str(item.get("id") or f"LI{index + 1}"),
         source=source,
-        title=text[:140] or f"LinkedIn post {index + 1}",
+        title=text[:140] or f"LinkedIn {kind} {index + 1}",
         body=text,
         url=url,
         author=author,
-        container="LinkedIn",
+        container="LinkedIn Article" if is_article else "LinkedIn",
         published_at=item.get("date"),
         date_confidence=_date_confidence(item, from_date, to_date, default="medium"),
         engagement=item.get("engagement") or {},
-        relevance_hint=item.get("relevance", 0.5),
+        relevance_hint=item.get("relevance", default_relevance),
         why_relevant=str(item.get("why_relevant") or ""),
         snippet=text[:200],
-        metadata={"author_display": author},
+        metadata={"author_display": author, "is_article": is_article},
     )

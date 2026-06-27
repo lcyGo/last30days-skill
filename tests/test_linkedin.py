@@ -5,38 +5,60 @@ from lib.linkedin import (
     _extract_posts,
     _int_field,
     _parse_date,
+    enrich_articles,
     parse_linkedin_response,
+    parse_profile_articles,
     search_linkedin,
 )
 
 
 class TestParseLinkedinResponse(unittest.TestCase):
     def _make_post(self, **overrides):
+        # Mirrors the live ScrapeCreators /v1/linkedin/search/posts post object:
+        # body in `description`, timestamp in `datePublished`, author as a nested
+        # dict, engagement in `likeCount`/`commentCount`, comments as a list.
         base = {
-            "id": "urn:li:activity:123",
-            "text": "Excited to share our latest product update.",
             "url": "https://www.linkedin.com/posts/example_123",
-            "author": "Jane Doe",
-            "date": "2026-06-01",
-            "likes": 42,
-            "comments": 5,
-            "reposts": 2,
+            "datePublished": "2026-06-01T12:30:00.000Z",
+            "description": "Excited to share our latest product update.",
+            "author": {
+                "name": "Jane Doe",
+                "url": "https://www.linkedin.com/in/janedoe",
+                "followers": 1234,
+            },
+            "comments": [{"author": "Bob", "text": "nice", "linkedinUrl": "x"}],
+            "likeCount": 42,
+            "commentCount": 5,
         }
         base.update(overrides)
         return base
 
-    def test_basic_post_parses_all_fields(self):
+    def test_real_shape_post_parses_all_fields(self):
         items = parse_linkedin_response({"posts": [self._make_post()]})
         self.assertEqual(1, len(items))
         item = items[0]
-        self.assertEqual("urn:li:activity:123", item["id"])
-        self.assertEqual("Excited to share our latest product update.", item["text"])
         self.assertEqual("https://www.linkedin.com/posts/example_123", item["url"])
+        self.assertEqual("Excited to share our latest product update.", item["text"])
         self.assertEqual("Jane Doe", item["author"])
+        self.assertEqual("https://www.linkedin.com/in/janedoe", item["author_url"])
         self.assertEqual("2026-06-01", item["date"])
         self.assertEqual(42, item["engagement"]["likes"])
         self.assertEqual(5, item["engagement"]["comments"])
-        self.assertEqual(2, item["engagement"]["reposts"])
+        self.assertFalse(item["is_article"])
+
+    def test_description_and_datepublished_only_parses_nonempty(self):
+        # Regression guard for the exact bug that shipped: the live API uses
+        # `description` + `datePublished`, and a parser keyed on `text`/`date`
+        # dropped every post (10 raw -> 0 items). This must stay non-empty.
+        raw = {
+            "description": "body via description field",
+            "datePublished": "2026-06-10T09:00:00Z",
+            "url": "https://www.linkedin.com/posts/abc",
+        }
+        items = parse_linkedin_response({"posts": [raw]})
+        self.assertEqual(1, len(items))
+        self.assertEqual("body via description field", items[0]["text"])
+        self.assertEqual("2026-06-10", items[0]["date"])
 
     def test_empty_posts_returns_empty_list(self):
         self.assertEqual([], parse_linkedin_response({"posts": []}))
@@ -44,7 +66,7 @@ class TestParseLinkedinResponse(unittest.TestCase):
 
     def test_post_without_text_is_skipped(self):
         raw = self._make_post()
-        del raw["text"]
+        del raw["description"]
         items = parse_linkedin_response({"posts": [raw]})
         self.assertEqual([], items)
 
@@ -69,10 +91,16 @@ class TestParseLinkedinResponse(unittest.TestCase):
         self.assertEqual("", items[0]["author"])
 
     def test_id_falls_back_to_generated_index(self):
+        # The live post object carries no top-level id/urn; the parser
+        # synthesizes a stable per-index id.
         raw = self._make_post()
-        del raw["id"]
         items = parse_linkedin_response({"posts": [raw]})
         self.assertEqual("LI1", items[0]["id"])
+
+    def test_explicit_urn_used_as_id(self):
+        raw = self._make_post(urn="urn:li:activity:999")
+        items = parse_linkedin_response({"posts": [raw]})
+        self.assertEqual("urn:li:activity:999", items[0]["id"])
 
     def test_alternate_field_names(self):
         raw = {
@@ -226,6 +254,140 @@ class TestDateRangeFiltering(unittest.TestCase):
         # counted toward "in range" and gets dropped since in_range is non-empty.
         self.assertEqual(1, len(items))
         self.assertEqual("has date in range", items[0]["text"])
+
+
+class TestArticleDetection(unittest.TestCase):
+    def test_pulse_url_tagged_as_article_and_boosted(self):
+        raw = {
+            "description": "long-form piece",
+            "datePublished": "2026-06-10",
+            "url": "https://www.linkedin.com/pulse/wtf-is-a-loop-matt-van-horn-abc",
+        }
+        item = parse_linkedin_response({"posts": [raw]})[0]
+        self.assertTrue(item["is_article"])
+        self.assertEqual(0.9, item["relevance"])
+
+    def test_posts_url_not_article_default_relevance(self):
+        raw = {
+            "description": "ordinary status update",
+            "datePublished": "2026-06-10",
+            "url": "https://www.linkedin.com/posts/example_123",
+        }
+        item = parse_linkedin_response({"posts": [raw]})[0]
+        self.assertFalse(item["is_article"])
+        self.assertEqual(0.5, item["relevance"])
+
+
+class TestProfileArticles(unittest.TestCase):
+    def _profile(self, **overrides):
+        base = {
+            "name": "Matt Van Horn",
+            "articles": [
+                {
+                    "headline": "WTF Is a Loop? Part 2",
+                    "url": "https://www.linkedin.com/pulse/wtf-loop-part-2-abc",
+                    "datePublished": "2026-06-20T21:06:18.000+00:00",
+                    "articleBody": "",
+                },
+                {
+                    "headline": "Every Agentic Engineering Hack I Know",
+                    "url": "https://www.linkedin.com/pulse/every-hack-def",
+                    "datePublished": "2026-06-04T02:31:36.000+00:00",
+                    "articleBody": "",
+                },
+            ],
+        }
+        base.update(overrides)
+        return base
+
+    def test_articles_parse_as_high_signal(self):
+        items = parse_profile_articles(self._profile())
+        self.assertEqual(2, len(items))
+        for it in items:
+            self.assertTrue(it["is_article"])
+            self.assertEqual(0.9, it["relevance"])
+            self.assertEqual("Matt Van Horn", it["author"])
+        self.assertEqual("WTF Is a Loop? Part 2", items[0]["text"])
+
+    def test_articles_respect_date_range(self):
+        items = parse_profile_articles(
+            self._profile(), from_date="2026-06-15", to_date="2026-06-26"
+        )
+        self.assertEqual(1, len(items))
+        self.assertEqual("WTF Is a Loop? Part 2", items[0]["text"])
+
+    def test_empty_or_missing_articles(self):
+        self.assertEqual([], parse_profile_articles({"name": "X"}))
+        self.assertEqual([], parse_profile_articles({"name": "X", "articles": []}))
+
+    def test_article_without_headline_skipped(self):
+        prof = {"name": "X", "articles": [{"url": "u", "datePublished": "2026-06-10"}]}
+        self.assertEqual([], parse_profile_articles(prof))
+
+
+class TestEnrichArticles(unittest.TestCase):
+    def _person_items(self):
+        # Parsed post items as enrich_articles receives them: a person-topic
+        # search returns posts authored by the subject.
+        return [
+            {"author": "Eric Siu", "author_url": "https://www.linkedin.com/in/ericosiu"},
+            {"author": "Matt Van Horn", "author_url": "https://www.linkedin.com/in/mattvanhorn"},
+        ]
+
+    def test_person_topic_enriches_via_one_profile_call(self):
+        profile = {
+            "name": "Matt Van Horn",
+            "articles": [
+                {"headline": "WTF Is a Loop?", "url": "https://www.linkedin.com/pulse/a", "datePublished": "2026-06-20"},
+            ],
+        }
+        with mock.patch(
+            "lib.linkedin.http.request", return_value=profile
+        ) as mock_request:
+            arts = enrich_articles(
+                self._person_items(), "Matt Van Horn", token="fake",
+                from_date="2026-05-27", to_date="2026-06-26",
+            )
+            self.assertEqual(1, len(arts))
+            self.assertTrue(arts[0]["is_article"])
+            self.assertEqual(0.9, arts[0]["relevance"])
+            # Bounded: exactly one profile call.
+            self.assertEqual(1, mock_request.call_count)
+            # And it fetched the matching author's profile, not the first author.
+            called_url = mock_request.call_args[0][1]
+            self.assertIn("mattvanhorn", called_url)
+
+    def test_keyword_topic_makes_no_profile_call(self):
+        with mock.patch("lib.linkedin.http.request") as mock_request:
+            arts = enrich_articles(
+                self._person_items(), "AI agents", token="fake",
+                from_date="2026-05-27", to_date="2026-06-26",
+            )
+            self.assertEqual([], arts)
+            mock_request.assert_not_called()
+
+    def test_no_token_no_call(self):
+        with mock.patch("lib.linkedin.http.request") as mock_request:
+            arts = enrich_articles(self._person_items(), "Matt Van Horn", token="")
+            self.assertEqual([], arts)
+            mock_request.assert_not_called()
+
+    def test_profile_error_returns_empty(self):
+        from lib import http as http_module
+
+        with mock.patch(
+            "lib.linkedin.http.request",
+            side_effect=http_module.HTTPError("boom", status_code=500),
+        ):
+            arts = enrich_articles(self._person_items(), "Matt Van Horn", token="fake")
+            self.assertEqual([], arts)
+
+    def test_no_author_url_no_call(self):
+        items = [{"author": "Matt Van Horn", "author_url": ""}]
+        with mock.patch("lib.linkedin.http.request") as mock_request:
+            arts = enrich_articles(items, "Matt Van Horn", token="fake")
+            self.assertEqual([], arts)
+            mock_request.assert_not_called()
 
 
 if __name__ == "__main__":

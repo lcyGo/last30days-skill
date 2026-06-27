@@ -1411,14 +1411,23 @@ def _retrieve_stream(
         )
         return instagram.parse_instagram_response(result), {}
     if source == "linkedin":
+        token = config.get("SCRAPECREATORS_API_KEY", "")
         result = linkedin.search_linkedin(
             subquery.search_query,
             from_date,
             to_date,
             depth=depth,
-            token=config.get("SCRAPECREATORS_API_KEY", ""),
+            token=token,
         )
-        return linkedin.parse_linkedin_response(result, from_date=from_date, to_date=to_date), {}
+        items = linkedin.parse_linkedin_response(
+            result, from_date=from_date, to_date=to_date
+        )
+        # Articles never appear in post search — surface them (high signal)
+        # via a bounded profile-enrichment lane on person topics.
+        items += linkedin.enrich_articles(
+            items, raw_topic or topic, token, from_date=from_date, to_date=to_date
+        )
+        return items, {}
     if source == "hackernews":
         result = hackernews.search_hackernews(subquery.search_query, from_date, to_date, depth=depth)
         return hackernews.parse_hackernews_response(result, query=subquery.search_query), {}
