@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.9.1] - 2026-07-03
+
+### Fixed
+
+- First-run setup wizard: the browser-cookie scan now tries Chrome/Chromium first (Keychain, no Full Disk Access) before Safari, so macOS users logged into X in Chrome authenticate in ~2s instead of hitting the Safari Full Disk Access dead-end. The winning browser is pinned for later runs only when it is Firefox/Safari, so Chrome never re-triggers the Keychain prompt. Consent copy leads with Chrome and the one-time "Always Allow" cue. ([#744](https://github.com/mvanhorn/last30days-skill/pull/744))
+- ScrapeCreators GitHub signup now surfaces the device code immediately (emitted to stdout so a backgrounded caller shows it at once, instead of a spinner until the process exits), validates the `XXXX-XXXX` code shape before copying/labeling it, short-circuits an already-registered account without a fresh device dance, and masks the API key on every status (not just success). Removed the false "GitHub CLI ~2 seconds, no browser" promise. ([#744](https://github.com/mvanhorn/last30days-skill/pull/744))
+- ScrapeCreators source opt-in is now two real tiers. The Step 5 choices were previously identical — a key auto-ran TikTok, Instagram, Threads, and YouTube comments regardless of `INCLUDE_SOURCES`, and Pinterest's opt-in silently ignored a persisted `INCLUDE_SOURCES`. Threads, YouTube comments, and Pinterest are now genuine `INCLUDE_SOURCES` opt-ins: **Recommended** = TikTok + Instagram + the rate-limit backups; **Everything** = also Threads, Pinterest, and YouTube/TikTok/Instagram comments. "ScrapeCreators backups" is now defined inline (keeps Reddit/YouTube working at rate limits). ([#744](https://github.com/mvanhorn/last30days-skill/pull/744))
+
 ## [3.9.0] - 2026-07-03
 
 ### Added
