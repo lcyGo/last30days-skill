@@ -213,8 +213,16 @@ def publish_rendered_html(
     return result
 
 
-def _publish_password_for_args(args: argparse.Namespace) -> str | None:
-    return (args.publish_password or env.read_secret_env("LAST30DAYS_PUBLISH_PASSWORD") or None)
+def _publish_password_for_args(
+    args: argparse.Namespace,
+    config: dict[str, object] | None = None,
+) -> str | None:
+    return (
+        args.publish_password
+        or env.read_secret_env("LAST30DAYS_PUBLISH_PASSWORD")
+        or (config or {}).get("LAST30DAYS_PUBLISH_PASSWORD")
+        or None
+    )
 
 
 def emit_output(
@@ -401,8 +409,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--synthesis-file", help="Markdown synthesis to embed in --emit=html output")
     parser.add_argument("--publish-html", action="store_true",
                         help="Publish --emit=html output to ht-ml.app (explicit opt-in; public by default)")
+    parser.add_argument("--publish", action="store_true",
+                        help="With 'library feed', publish the HTML index and briefs (explicit opt-in; public by default); feed.xml remains local")
     parser.add_argument("--publish-password",
-                        help="Optional shared password for --publish-html; prefer LAST30DAYS_PUBLISH_PASSWORD to avoid exposing secrets in process lists")
+                        help="Optional shared password for --publish-html or 'library feed --publish'; prefer LAST30DAYS_PUBLISH_PASSWORD to avoid exposing secrets in process lists")
     parser.add_argument("--store", action="store_true", help="Persist ranked findings to the SQLite research store")
     parser.add_argument("--x-handle", help="X handle for targeted supplemental search")
     parser.add_argument("--x-related", help="Comma-separated related X handles (searched with lower weight)")
@@ -1235,7 +1245,7 @@ def _render_save_and_print(
         try:
             publish_result = publish_rendered_html(
                 rendered,
-                password=_publish_password_for_args(args),
+                password=_publish_password_for_args(args, config),
                 companion_paths=publish_companion_paths,
             )
             sys.stderr.write(f"[last30days] Published HTML to {publish_result['url']}\n")
@@ -1338,7 +1348,7 @@ def _validate_extra_argv(parser: argparse.ArgumentParser, topic: str, extra_argv
 def _config_policy_for_args(args: argparse.Namespace, topic: str, extra_argv: list[str]) -> env.ConfigLoadPolicy:
     if args.no_browser_cookies:
         browser_mode = "off"
-    elif args.diagnose or args.preflight or topic.lower() == "doctor":
+    elif args.diagnose or args.preflight or topic.lower() in {"doctor", "library feed"}:
         # doctor is plan-only like --diagnose: it must never read cookies.
         browser_mode = "plan_only"
     elif topic.lower() == "setup":
@@ -1349,6 +1359,164 @@ def _config_policy_for_args(args: argparse.Namespace, topic: str, extra_argv: li
         browser_cookies=browser_mode,
         inspect_ignored_project_config=args.diagnose or args.preflight or topic.lower() == "doctor",
     )
+
+
+def _run_library_feed(args: argparse.Namespace, config: dict[str, object]) -> int:
+    """Generate the local research index/feed and optionally publish it."""
+    from lib import feed, html_publish, library
+
+    if args.publish_html:
+        sys.stderr.write(
+            "[last30days] library feed uses --publish, not --publish-html.\n"
+        )
+        return 2
+    if args.output:
+        sys.stderr.write(
+            "[last30days] library feed writes index.html and feed.xml to --save-dir; "
+            "--output is not supported.\n"
+        )
+        return 2
+
+    memory_dir = Path(args.save_dir).expanduser() if args.save_dir else library.DEFAULT_MEMORY_DIR
+    output_dir = memory_dir.resolve()
+    # Scoped libraries (--save-dir) must not mix in the global briefing
+    # archive: a client-specific or publishable feed pulling unrelated default
+    # briefings could publish them publicly. The default library keeps the
+    # archive; a scoped one reads only its own directory.
+    briefs_dir = (
+        library.DEFAULT_BRIEFS_DIR if not args.save_dir else memory_dir / "briefings"
+    )
+    entries, notes = library.scan_library(memory_dir, briefs_dir)
+    feed_author = str(
+        config.get("LAST30DAYS_LIBRARY_OWNER") or "last30days research library"
+    )
+    output_dir.mkdir(parents=True, exist_ok=True)
+    library_id = library.get_or_create_library_id(output_dir)
+    rendered_briefs_dir = output_dir / "briefs"
+    rendered_briefs_dir.mkdir(parents=True, exist_ok=True)
+
+    def _preserve_hand_written_page(existing_path: Path, generated_marker: str) -> None:
+        """Back up any page library feed did not generate before overwriting it."""
+        if not existing_path.exists():
+            return
+        try:
+            marker_found = generated_marker in existing_path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            marker_found = False
+        if marker_found:
+            return
+        backup = existing_path.with_suffix(existing_path.suffix + ".bak")
+        counter = 1
+        while backup.exists():
+            backup = existing_path.with_suffix(f"{existing_path.suffix}.bak{counter}")
+            counter += 1
+        existing_path.replace(backup)
+        sys.stderr.write(
+            f"[last30days] {existing_path.name} was not generated by "
+            f"library feed; preserved the original at {backup.name}\n"
+        )
+
+    brief_documents: dict[str, str] = {}
+    for entry in entries:
+        rendered = html_render.render_library_brief(entry)
+        target = rendered_briefs_dir / entry.output_name
+        _preserve_hand_written_page(target, html_render.LIBRARY_BRIEF_MARKER)
+        target.write_text(rendered, encoding="utf-8")
+        brief_documents[entry.entry_id] = rendered
+
+    current_brief_names = {entry.output_name for entry in entries}
+    for path in rendered_briefs_dir.glob("*.html"):
+        is_orphan = path.name not in current_brief_names
+        if not (is_orphan and library.is_generated_brief_name(path.name)):
+            continue
+        # A generated-looking name is not proof of ownership; only prune
+        # pages that carry the renderer's own marker.
+        try:
+            generated = html_render.LIBRARY_BRIEF_MARKER in path.read_text(
+                encoding="utf-8"
+            )
+        except (OSError, UnicodeDecodeError):
+            generated = False
+        if generated:
+            path.unlink()
+
+    feed_xml = feed.render_atom(entries, library_id=library_id, author=feed_author)
+    index_html = html_render.render_library_index(entries)
+    feed_path = output_dir / "feed.xml"
+    index_path = output_dir / "index.html"
+    _preserve_hand_written_page(feed_path, "urn:last30days:research-library")
+    _preserve_hand_written_page(
+        index_path, "Generated locally by <strong>last30days</strong>"
+    )
+    feed_path.write_text(feed_xml, encoding="utf-8")
+    index_path.write_text(index_html, encoding="utf-8")
+
+    for note in notes:
+        sys.stderr.write(f"[last30days] Library note: {note}\n")
+    sys.stderr.write(
+        f"[last30days] Library feed generated {len(entries)} brief(s): "
+        f"{index_path} and {feed_path}\n"
+    )
+
+    if args.publish:
+        password = _publish_password_for_args(args, config)
+        entry_urls: dict[str, str] = {}
+        try:
+            brief_results = html_publish.publish_html_documents(
+                brief_documents,
+                password=password,
+            )
+            entry_urls = {
+                entry_id: str(result["url"])
+                for entry_id, result in brief_results.items()
+            }
+            if batch_error := getattr(brief_results, "error", None):
+                raise batch_error
+            published_index = html_render.render_library_index(
+                entries,
+                entry_urls=entry_urls,
+                feed_url=None,
+            )
+            index_result = html_publish.publish_html(published_index, password=password)
+            index_url = str(index_result["url"])
+        except (html_publish.HtmlPublishError, KeyError, OSError) as exc:
+            sys.stderr.write(f"[last30days] Library publish failed: {exc}\n")
+            if entry_urls:
+                sys.stderr.write(
+                    f"[last30days] Partial publish: {len(entry_urls)} public brief "
+                    "page(s) were created before the failure.\n"
+                )
+            return 1
+
+        # Keep the local artifacts useful as a record of the live publication.
+        feed_path.write_text(
+            feed.render_atom(
+                entries,
+                library_id=library_id,
+                entry_urls=entry_urls,
+                author=feed_author,
+            ),
+            encoding="utf-8",
+        )
+        index_path.write_text(
+            html_render.render_library_index(entries, entry_urls=entry_urls),
+            encoding="utf-8",
+        )
+        sys.stderr.write(f"[last30days] Published library to {index_url}\n")
+        sys.stderr.write(f"[last30days] Local Atom feed: {feed_path}\n")
+        print(
+            f"Library: {index_url}\nFeed: {feed_path}\n"
+            "Atom feed is local; host feed.xml on any static host (for example, GitHub Pages) "
+            "to make it subscribable."
+        )
+        return 0
+
+    print(
+        f"Library: {index_path}\nFeed: {feed_path}\n"
+        "Atom feed is local; host feed.xml on any static host (for example, GitHub Pages) "
+        "to make it subscribable."
+    )
+    return 0
 
 
 def main() -> int:
@@ -1378,6 +1546,11 @@ def _main(
     topic = " ".join(args.topic).strip()
     original_topic = topic
     _validate_extra_argv(parser, topic, extra_argv)
+    if args.publish and topic.lower() != "library feed":
+        sys.stderr.write(
+            "[last30days] --publish is only supported by the 'library feed' command.\n"
+        )
+        return 2
     config = env.get_config(policy=_config_policy_for_args(args, topic, extra_argv))
     _propagate_config_to_environ(config)
 
@@ -1426,6 +1599,9 @@ def _main(
             emit_json=(args.emit == "json" or "--json" in extra_argv),
             cached="--cached" in extra_argv,
         )
+
+    if topic.lower() == "library feed":
+        return _run_library_feed(args, config)
 
     # Handle setup subcommand
     if topic.lower() == "setup":
